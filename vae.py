@@ -5,8 +5,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 from torchvision.utils import save_image, make_grid
+from loss import ZINBLoss, MeanAct, DispAct
 
-# create a transofrm to apply to each datapoint
+# create a transform to apply to each datapoint
 transform = transforms.Compose([transforms.ToTensor()])
 
 #read the training data
@@ -29,34 +30,38 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class VAE(nn.Module):
 
-	def __init__(self, input_dim=1422, hidden_dim=400, latent_dim=200,device=device):  # input dim is number of taxa
+	def __init__(self, input_dim=1422, hidden_dim=400, latent_dim=5,device=device):  # input dim is number of taxa
 		super(VAE, self).__init__()
 
 		# encoder
 		self.encoder = nn.Sequential(
 			nn.Linear(input_dim, hidden_dim),
-			nn.LeakyReLU(0.2),
-			nn.Linear(hidden_dim, latent_dim),
 			nn.LeakyReLU(0.2)
 		)
 
 		# latent mean and variance
-		self.mean_layer = nn.Linear(latent_dim, 2)
-		self.logvar_layer = nn.Linear(latent_dim, 2)
+		#self.mean_layer = nn.Linear(latent_dim, 2)
+		#self.logvar_layer = nn.Linear(latent_dim, 2)
 
 		# decoder
 		self.decoder = nn.Sequential(
-			nn.Linear(2, latent_dim),
-			nn.LeakyReLU(0.2),
 			nn.Linear(latent_dim, hidden_dim),
 			nn.LeakyReLU(0.2),
 			nn.Linear(hidden_dim, input_dim),
 			nn.Sigmoid()
 		)
 
+		self._enc_mu = nn.Linear(hidden_dim, latent_dim)
+		self._enc_logvar = nn.Linear(hidden_dim,latent_dim)
+		self._dec_mean = nn.Sequential(nn.Linear(hidden_dim, input_dim), MeanAct())
+		self._dec_disp = nn.Sequential(nn.Linear(hidden_dim, input_dim), DispAct())
+		self._dec_pi = nn.Sequential(nn.Linear(hidden_dim, input_dim), nn.Sigmoid())
+		# loss function
+		self.zinb_loss = ZINBLoss()
+
 	def encode(self, x):
 		x = self.encoder(x)
-		mean, logvar = self.mean_layer(x), self.logvar_layer(x)
+		mean, logvar = self._enc_mu(x), self._enc_logvar(x)
 		return mean, logvar
 
 	def reparameterization(self, mean, var):
@@ -68,32 +73,44 @@ class VAE(nn.Module):
 		return self.decoder(x)
 
 	def forward(self, x):
-		mean, logvar = self.encode(x)
-		z = self.reparameterization(mean, logvar)
-		x_hat = self.decode(z)
-		return x_hat, mean, logvar
+		latent_mean, logvar = self.encode(x) # get the mean and log variance of the latent space
+		z = self.reparameterization(mean, logvar) # reparameterization trick
+		x_hat = self.decode(z) # get the decoded output
+		_mean = self._dec_mean(x_hat) # output of initial size
+		_disp = self._dec_disp(x_hat) # dispersion estimate
+		_pi = self._dec_pi(x_hat) # pi estimate
+		return latent_mean, logvar, _mean, _disp, _pi
+
+	def reconstruct(self, x):
+		return self.decode(self.encode(data))
+
+
 
 model = VAE().to(device)  # this switches the data/model/whatever to whatever device you want to work on (eg from CPU memory to a GPU)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)  # Adam is an algorithm for stochastic optimization
 
-def loss_function(x, x_hat, mean, log_var):
-	reproduction_loss = nn.functional.mse_loss(x_hat, x, reduction='sum')
-	#reproduction_loss = nn.functional.binary_cross_entropy(x_hat, x, reduction='sum')
+def loss_function(mean, log_var):
+	#reproduction_loss = nn.functional.mse_loss(x_hat, x, reduction='sum')
 	KLD = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
-	return reproduction_loss + KLD
+	return zinb + KLD
+
+def KLD(mean, log_var):
+	KLD = - 0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+	return KLD
+
 
 def train(model, optimizer, epochs, device,features):
-	model.train()
+	model.train() # set model to training mode
 	for epoch in range(epochs):
 		overall_loss = 0
-		for batch_idx, x in enumerate(train_loader): #the _ is for the 'target data', which we don't have (it's basically a place holder)
+		for batch_idx, x in enumerate(train_loader):
 			x = x.view(batch_size,features).to(device)
 
 			optimizer.zero_grad()
-
-			x_hat, mean, log_var = model(x)
-			loss = loss_function(x, x_hat, mean, log_var)
-
+			latent_mean, latent_logvar, mean, disp, pi = model(x)
+			KLD_loss = KLD(latent_mean,latent_logvar)
+			zinb_loss = model.zinb_loss(x,mean, disp, pi)
+			loss = KLD_loss + zinb_loss
 			overall_loss += loss.item()
 
 			loss.backward()
@@ -103,5 +120,5 @@ def train(model, optimizer, epochs, device,features):
 	return overall_loss
 
 
-output = train(model, optimizer, epochs=50, device=device,features=train_dataset.shape[1])
+output = train(model, optimizer, epochs=20, device=device,features=train_dataset.shape[1])
 
